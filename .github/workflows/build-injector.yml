@@ -1,0 +1,81 @@
+# Save as: .github/workflows/injector.yml   (commit to the default branch)
+# Repo root must contain: esp_inject.sh, esp_overlay.cpp, libesp_core.so
+# Triggers: every push (appears in Actions immediately) and manual run with a package id.
+name: Build Injector
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Game package id (e.g. com.vendor.game). Empty = keep FILL in the script"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PKG: ${{ inputs.package }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check repository files
+        run: |
+          set -eu
+          echo "Files in repo root:"; ls -la
+          for f in esp_inject.sh esp_overlay.cpp libesp_core.so; do
+            [ -f "$f" ] || { echo "::error::missing file in repo root: $f"; exit 1; }
+          done
+          echo "libesp_core.so sha256: $(sha256sum libesp_core.so | cut -d' ' -f1)"
+
+      - name: Locate NDK
+        run: |
+          set -eu
+          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          if [ -z "$NDK" ]; then
+            NDK="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          [ -n "$NDK" ] && [ -d "$NDK" ] || { echo "::error::Android NDK not found on runner"; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "Using NDK: $NDK"
+
+      - name: Build libesp_overlay.so
+        run: |
+          set -eu
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          "$TC/bin/aarch64-linux-android24-clang++" -shared -fPIC -O2 -std=c++17 -fvisibility=hidden \
+            esp_overlay.cpp -o libesp_overlay.so -llog -lEGL -lGLESv2 -ldl
+          cp "$TC/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" libc++_shared.so
+          readelf -d libesp_overlay.so | grep NEEDED
+
+      - name: Assemble bundle
+        run: |
+          set -eu
+          mkdir -p dist
+          cp esp_inject.sh dist/esp_inject.sh
+          if [ -n "${PKG:-}" ]; then
+            printf '%s' "$PKG" | grep -Eq '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$' \
+              || { echo "::error::invalid package id: $PKG"; exit 1; }
+            sed -i "s/^PKG=\"FILL\"/PKG=\"$PKG\"/" dist/esp_inject.sh
+            grep -q "^PKG=\"$PKG\"" dist/esp_inject.sh || { echo "::error::PKG substitution failed"; exit 1; }
+            echo "PKG baked in: $PKG"
+          else
+            echo "No package id given: PKG stays FILL (edit line 7 of esp_inject.sh on the device)"
+          fi
+          chmod +x dist/esp_inject.sh
+          cp libesp_core.so libesp_overlay.so libc++_shared.so dist/
+          sh -n dist/esp_inject.sh
+          ls -l dist
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-injector-bundle
+          path: dist/
+          if-no-files-found: error
